@@ -1,0 +1,12 @@
+
+
+every email (of a bulk send) assigns itself a new number and copies itself to the database.  No more letter numbers having to be assigned.
+
+---
+
+everytime it runs it stores a copy of all of its praramentes in a database.
+Next time the previous command line can just be recalled. 
+
+----
+
+

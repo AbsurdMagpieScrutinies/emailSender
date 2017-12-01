@@ -1,0 +1,539 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+use autodie;
+use charnames           qw< :full >;
+use File::Basename      qw< basename >;
+use Carp                qw< carp croak confess cluck >;
+use POSIX;
+use English             qw( -no_match_vars ) ;
+use feature             'say';
+END { close STDOUT }
+$0 = basename($0);  # shorter messages
+$| = 1;                 # autoflush: solving perl's stupidities 1 by 1
+use Data::Dumper;       # for debugging, you never know ...
+
+# --- unicode ---
+use utf8;               # source code is UTF-8
+binmode STDOUT, ":encoding(UTF-8)";
+binmode STDERR, ":encoding(UTF-8)";
+use utf8::all;
+use feature             qw< unicode_eval >;   # for correct unicode eval's
+use Unicode::Normalize  qw< NFD NFC >;
+use Encode              qw< encode decode >;
+use warnings            qw< FATAL  utf8     >;
+use open                qw< :std  :utf8     >;
+use feature             qw< unicode_strings >;# else lc( ) won't do unicode
+# if (grep /\P{ASCII}/ => @ARGV) {
+#    @ARGV = map { decode("UTF-8", $_) } @ARGV;
+# }
+
+
+# =============================================================================
+#this script :
+# sends emails based on the data in the 'data-file' and the letter template file
+#
+# first it processes the letter template
+# over each data file line, 
+#	read and clean each datavalue in the record. 
+#	cleanEmailAddr()  correctJournalName() titleCase() are used
+#		use writeSingleDBValue( badEmailAddr ) if isGoodEmailAddr() fails
+#	construct a letter, randomly, from the options in the letter template file
+#		the template is zzzzz {aaaa|bbbb} zzzzz {ccc|ddd|eee} zzz ....
+#		what choices made are recorded.
+#	substitute the data from the data file into the rawletter
+#	use mutt to send the email. (and ssmtp or similiar)
+#	every 50, send a duplicate to the $debugEmailAddr
+#	record the email's sending in the $mysql_transTable table.
+#
+#	TODO : read letter and values from a database, just use a letterID number
+#	TODO : replace __1__ __7__ values from colums of the datafile without going
+#			via --c1, --c7 parameters
+#
+# =============================================================================
+
+
+# --- program parameters, constants, ...
+
+require ("sdmPerlFunctions.pl");
+
+
+my $tmpDir = "/tmp/zxzxzxzx";
+my $emailTmpFileName="/tmp/emailSender.tmp";
+my $localEmailCopyFilename="sampleSentEmail.txt";
+my $debugEmailAddr="test\@stephen-mcgregor.com";
+my $startAtDataRecordNumber;
+# want these to be standardized. 
+my $placeHolderInitialTag="__";
+my $placeHolderFinalTag="__";
+my $debug = testIfDebugging ( );
+my $howManyToSend=10000;
+$howManyToSend = 10 if ($debug);
+
+
+# --- useage message
+my $usage= <<USAGE;
+
+Sends copies of the emailTextFile with any __fields__ replaced by 
+values from the optional datafile. The to-addresses come from the
+datafile: no datafile means a single email only can be sent.
+
+usage: 
+$0
+     -e emailTextFile 
+     -s subjectLine 	# __aaa__ substitution fields can be used
+     --from from\@email.address 
+     --fromName  \"Mr Richard Pearse\" 
+     --to {colNumber|to\@email.com} 
+     --desc \"description of email\(s\)\"  
+     [-i datafile ] 	
+     [--no-DB]			# no recording in the DB at all
+	 [--no-save-email]	# no copy of the email (only) into the DB  
+     [--noEmailChecks]	
+     [[--c1 placeHolderText] [--c4 placeHolderText] ...] 
+     [[--attach fileName1.coc] [--attach fileName2.jpg] ... ]
+
+Any of the first 9 columns of the datafile can be used; any of c1 to c9. 
+The data-file fields are 1 based (not 0)
+The c1, c2 ... c9 are datafile colummns, matching to each placeHolderText 
+in the letter template file.
+--c3 = 'something' replaces the __something__ with column #3's text 
+
+Any number of attachments can be added. 
+
+If the env var 'debug' is set to 'true' (and export-ed) then 
+-  the emails are sent to $debugEmailAddr instead, and
+-  debug messages will be printed
+Type \"export debug=true\" at the command prompt to set this 
+
+Unless '--no-DB' is used, the email address and a company have to ALREADY 
+be in the master contact table (\"static\") for this program to run properly. Currently hardcoded to use the \'contact\' database .
+
+WARNING: this program KILLs any running (or hung) mutt instances
+
+USAGE
+
+if (( $#ARGV < 4 ) )  {
+	print $usage;
+	die "\n";
+};
+
+
+#--- process commandline
+
+my $INFILE="error: No datafile specified";
+my $LETTFILE="error: No Letterfile specified";
+my $origSubjectLine="error: No subject line specified";
+my $fromAddress="error: No from address specified"; 
+my $fromName="error: No from Name specified";
+my $rawToAddr="error: No raw to address specified";
+my $noEmailChecks;		# default: check emails
+my $noSaveEmail;		# default: save the email
+my $noDBinteractions;	# default: interact with the DB
+my $descriptionOfEmails="no description given";
+my @dataColumns2letterPlaceholders=();
+my @attachments;
+
+
+use Getopt::Long;
+GetOptions(	"i:s"			=> \$INFILE,
+			"e=s"			=> \$LETTFILE,
+			"s=s"			=> \$origSubjectLine,
+			"from=s"		=> \$fromAddress,
+			"fromName=s"	=> \$fromName,
+			"to=s"			=> \$rawToAddr,
+			"noEmailChecks"	=> \$noEmailChecks,
+			"no-save-email"	=> \$noSaveEmail,
+			"no-DB"			=> \$noDBinteractions,
+			"desc=s"		=> \$descriptionOfEmails,
+			"c1:s"			=> \$dataColumns2letterPlaceholders[1],
+			"c2:s"			=> \$dataColumns2letterPlaceholders[2],
+			"c3:s"			=> \$dataColumns2letterPlaceholders[3],
+			"c4:s"			=> \$dataColumns2letterPlaceholders[4],
+			"c5:s"			=> \$dataColumns2letterPlaceholders[5],
+			"c6:s"			=> \$dataColumns2letterPlaceholders[6],
+			"c7:s"			=> \$dataColumns2letterPlaceholders[7],
+			"c8:s"			=> \$dataColumns2letterPlaceholders[8],
+			"c9:s"			=> \$dataColumns2letterPlaceholders[9],
+			"attach:s"		=> \@attachments);
+
+#--- check and process commandline parameters
+
+my $in=();
+my $amProcessingDatafile = 0;
+if ($INFILE !~ /^error:/) {
+	open($in,    "<", $INFILE)  or die "Can't open datafile: $INFILE: $!";
+	$amProcessingDatafile = 1;
+};
+
+open(my $letterTemplatefile,    "<", $LETTFILE)  or die "Can't open letter text file $LETTFILE: $!";
+
+my $toAddrCol =  $rawToAddr;
+my $useCommandLineToAddr = 'false'; 
+$useCommandLineToAddr='true'if ($rawToAddr =~ /\@/);
+
+if ((not $amProcessingDatafile) and (not $useCommandLineToAddr)) {
+	die "Must supply a \"to\" email address on the commandline or in a data file\n";
+}
+if (($amProcessingDatafile) and ($useCommandLineToAddr eq 'true')) {
+	die "Nooo.... emailAddr must not be both on commandline and in the datafile.\n ";
+}
+if ($descriptionOfEmails eq "no desc defined") {
+	die "A description of your email(s) must be provided, for posterity.\n";
+};
+
+my $tmp3;
+foreach (@attachments){ 
+	open($tmp3, "<", $_ ) or die "Can't open attachment $_ : $! ";
+	close $tmp3;
+}
+
+# --- other checks and setups
+
+# mysql must be running (unless $noDBinteractions) . 
+if (not $noDBinteractions){
+die "\n\nRun the mySql system before running this program. \n\n" 
+	if (not mysqlIsRunningTest()); 
+}
+
+# remove any left overs from previous runs 
+` rm -f  $emailTmpFileName`; 
+` killall -q mutt `;
+` killall -q mutt_lock `;
+
+# test that mails should be sent for real.
+if (not $debug) {
+	$|++;				# unbuffer the stdout. Yes, really. 
+	print	"\n*** The emails will REALLY be sent: this is not a test.      ***\n";
+	print	"*** [Have you spell-checked the final version of your email?] ***\n\n";
+	print	"*** Press CTRL-C now to stop the sending of the emails! ***\n";
+	sleep 1;
+	foreach my $i (3,2,1) {print "$i ... "; sleep 1;};
+	print "\n\n";
+} else {
+	print "\n\n*** This is a debugging run (max 10 emails will be sent) ***\n\n";
+}
+
+
+#--- read the letter template file in 
+my $rawInLetter = "";
+while (<$letterTemplatefile>) {
+	$rawInLetter = $rawInLetter.$_;
+}	
+my @letterParts = split (/\{|\}/, $rawInLetter);
+my $optionsInThisLetter='true';
+$optionsInThisLetter='false' if (1==@letterParts);
+die("Corrupt letter, must be aaa{bbb|ccc}aaa{ddd|eee}aaa... [balanced braces]")
+	if (0==(@letterParts % 2));
+
+
+
+#--- storing the letter auto into the database (at last)
+my $letterID = -1; 
+if ((not $noSaveEmail) and (not $noDBinteractions)) {
+	my $sqlstr;
+	# test the local file
+	my $letFileWithPath = `pwd`; chomp $letFileWithPath;
+	$letFileWithPath = $letFileWithPath . '/' . $LETTFILE;
+	open($tmp3, "<", $letFileWithPath ) or die "Can't open the letter file for DB $_ : $! ";
+	close $tmp3;
+	# get the largest letter_recID
+	$sqlstr = " mysql -D contact -e \" "						# default is group
+	." SELECT  max(letter_recID ) FROM lettersEmails ;\" ";  	# on all rows. 
+	my @sqlResults = `$sqlstr`;
+	say "Error in getting the maximum letter ID" if (2 != @sqlResults);
+	chomp $sqlResults[1];
+	$letterID = $sqlResults[1] +1;								# the next ID
+	say "This email template would have been saved as number $letterID "
+		if ($debug)	;
+
+	if (not $debug) {
+		# copy it somewhere mysql can access it
+		`mkdir $tmpDir`; 				`chmod a+rwx $tmpDir`;
+		`cp $letFileWithPath $tmpDir`; 	`chmod a+rwx $tmpDir/* `;
+		my $shortFilename = `ls -1 $tmpDir`;  
+		chomp $shortFilename;
+		# upload and insert the letter text
+		$sqlstr = " mysql -D contact  -e \" "
+		." INSERT INTO lettersEmails "
+		."(letter_recID,letter_text,description,targetAudience) "
+		." VALUES ($letterID , " 
+		.qq{  LOAD_FILE('$tmpDir/$shortFilename'),\'$descriptionOfEmails\', \'\'  ) } 
+		." ; \" ";
+		`$sqlstr `;
+		# clean up the temp files
+		`rm $tmpDir/$shortFilename; rmdir $tmpDir`;
+	}
+}
+
+
+
+# --- processing each line of input data
+my $continueProcessingCondition=1;
+# skip intial records
+if (($amProcessingDatafile) && ($startAtDataRecordNumber)) {
+print "=== skipping records :\n";
+for (my $ia=0; $ia<$startAtDataRecordNumber;$ia++) {
+	<$in>;
+	my $ddd = $_;
+	#	print "\t #$ia";  DBG
+}
+print "\n";
+}
+# go through (once) if no datafile
+my $emailSentCount=0;
+do {{					# double {{ for the 'next' inside a 'do'
+
+	my $subjectLine = $origSubjectLine;
+	my $finalLetter = $rawInLetter;
+	my $toEmailAddr = $rawToAddr;
+	my @letterStructureRecord=();
+
+	if ($amProcessingDatafile) {
+		goto FUCKED_PERL_LOOPS if eof $in;
+		my $line = (<$in>);
+		next if not defined $line;					# undefined is false
+		chomp $line;
+		next if ($line =~ /^#/);					# skip cocmment lines
+		next if ($line !~ /\w/);
+
+		# clean the input data
+		my @currRecord = split (/\t/, $line) ;
+		for (@currRecord) {
+			chomp $_; 
+			$_ =~ s/^\s+|\s+$//g;
+		}
+
+		# --- get the 'to' email address
+		
+		$toEmailAddr = ();
+		# cols : entered 1 based, used 0 based
+		$toEmailAddr =
+			($useCommandLineToAddr eq 'true') ? $rawToAddr : $currRecord[$toAddrCol-1]; 
+		if (not $noEmailChecks) {
+			$toEmailAddr=cleanEmailAddr($toEmailAddr);
+			if (not isGoodEmailAddr($toEmailAddr)) {
+				`cm markbad $toEmailAddr` ;
+				# next if bad email address
+				next;
+			}
+		}
+
+		#--- changing, alternative text in the letter text
+		
+		my $rawOutLetter=();  $rawOutLetter="";
+		if ('true' eq $optionsInThisLetter) {
+			for (my $letterpartCount=0; 
+				$letterpartCount < @letterParts; 
+				$letterpartCount++) {
+				my $currLetterpart = $letterParts[ $letterpartCount ];
+				
+				#  simply write the non-optional text
+				if ($currLetterpart !~ /\|/){
+					$rawOutLetter =$rawOutLetter.$currLetterpart;
+					$letterStructureRecord[ $letterpartCount ] = 'x';
+				}
+				else {
+
+					#  chooose amongst the optional text(s), and write
+					my $subPartCount = 1 + ($currLetterpart =~ tr/\|//);
+					my $whichSubPart = int rand()*$subPartCount;	# not + 1
+					my @subparts = split(/\|/, $currLetterpart);    # inefficient
+					if ($subparts[ $whichSubPart ]) {
+						$rawOutLetter = $rawOutLetter.$subparts[ $whichSubPart ];
+					}
+					$letterStructureRecord[ $letterpartCount ] = $whichSubPart;
+				};
+			};
+		}
+
+		#--- letter and subject line: insert db data 
+
+		$finalLetter = $rawOutLetter if ('true' eq $optionsInThisLetter) ;
+		for (my $count=0; $count <= $#dataColumns2letterPlaceholders; $count++) {
+			if (defined($dataColumns2letterPlaceholders[$count])) {
+				my $currPH = $placeHolderInitialTag
+							.$dataColumns2letterPlaceholders[$count]
+							.$placeHolderFinalTag;
+
+				# for capitalized __Helloworld__ match strings ('H' c.f. 'h')
+				(my $capitalizedMatchString = $dataColumns2letterPlaceholders[$count] ) 
+					=~ s,^(\w)(.*),\u$1$2, ;
+				my $currPH_capitalized 
+							= $placeHolderInitialTag
+							.$capitalizedMatchString
+							.$placeHolderFinalTag;
+				print "=== $count \t $currPH -->\t $currRecord[$count-1]\n";
+
+				# -1, as 1 based on commandline & data file, 0 based in reality
+				my $currToReplace = $currRecord[$count-1];
+				# "NULL" becomes ""
+				$currToReplace =~ s,\bNULL\b,,  ;
+				# remove terminal ,.;- from inserted fields
+				$currToReplace  =~ s|[\,\.\;\-]+$||;
+				# replace the placeholders with the current 'replace text'
+				$finalLetter =~ s/\b$currPH\b/$currToReplace/g;
+				$subjectLine =~ s/\b$currPH\b/$currToReplace/g;
+				# Capitalized: UpperCase first letter 
+				( my $currToReplace_UC = $currToReplace ) 
+					=~ s,^(\w)(.*),\u$1$2, ; 
+				
+				# update the letter text: do replacements of one placeholder
+				$finalLetter =~ s/\b$currPH_capitalized\b/\u$currToReplace_UC/g;
+				$subjectLine =~ s/\b$currPH_capitalized\b/\u$currToReplace_UC/g;
+			}
+		}
+
+		print "=== \'to\' email address -->\t $toEmailAddr \n";
+		
+
+	} # ifProcessingInputFile  
+
+	#--- post-modify the letter: cleverness 
+
+	# a or an ?
+	while ($finalLetter =~ /__a_an__/) {
+		if ($finalLetter =~ /(__a_an__)\s([aeiouAEIOU])/) {
+			$finalLetter =~ s/__a_an__\s/an /;
+		}
+		if ($finalLetter =~ /(__a_an__)\s([^aeiouAEIOU])/) {
+			$finalLetter =~ s/__a_an__\s/a /;
+		}
+	}
+
+	# store the letter text in a tmp file : necessary 
+	open( my $emailTmpFile, ">", $emailTmpFileName);
+	print $emailTmpFile $finalLetter;			
+	close ($emailTmpFile);
+
+
+	# --- send the email
+
+	# build up the mail (mutt) command
+	$emailSentCount++;
+	my $cmdStr=     "mutt "
+	." -F /home/me/mail/muttNullConffile.rc  "
+	." -e \"unmy_hdr from; my_hdr From: $fromAddress \"  "
+	." -e \"set realname=\'$fromName\' \"    "
+	." -s \"$subjectLine\"  ";
+	$cmdStr = ($#attachments == -1) 
+			? $cmdStr
+			: $cmdStr." -a  $attachments[$_] " foreach 0 .. $#attachments;
+	$cmdStr = $cmdStr
+	." \-\- $toEmailAddr "
+	." \< $emailTmpFileName ";
+	print "=== Sending ...  ";
+
+	# debug
+	if ($debug) {
+		# messages
+		print "\n            [FAKED : really to $debugEmailAddr] \n";
+		print "=== Would have run this command:\n\t $cmdStr \n " ; 
+		# changes: send to a fake, test, address	
+		$cmdStr =~ s/$toEmailAddr/$debugEmailAddr/g;
+	}
+
+	# actually send the email
+	print "\n";
+	system ("rm -f ~/sent.lock ");
+	system ("$cmdStr");
+	print "  ... sent  email #$emailSentCount ============";
+	print "\n";
+
+	# every 50, (and 2nd and 10th emails) send a copy to the debug address
+	if (	(0== ($emailSentCount % 50)
+		|| 	(2==$emailSentCount))			# not for single emails
+		|| 	(10==$emailSentCount)){
+		$cmdStr =~ s/$toEmailAddr/$debugEmailAddr/g;
+		my $newSubLine ="Check Email : ".$subjectLine; 
+		$cmdStr =~ s/$subjectLine/$newSubLine/;
+		print "=== CHECK EMAIL TO BE SENT \n";
+		system ("$cmdStr");
+		print "\n";
+		# and use as the sample email
+		` cp $emailTmpFileName $localEmailCopyFilename`;
+		}
+
+	#--- record the details for contacts db
+
+	if ((not $debug) and (not $noDBinteractions)) {
+		# this requires the mysql server to be running, which is checked
+		# for at startup (if neither of these options are specified)
+		my $letStrctStr="";
+		if ($optionsInThisLetter) {
+			for my $ccc (@letterStructureRecord) {
+				$letStrctStr = $letStrctStr.$ccc.":";
+			}
+			chop $letStrctStr;		# remove final ':'
+		}
+
+		# using the complete email addr should return a single record,
+		# so no prompting the user to choose which email addr from multichoice
+		my $coName;
+		(undef, $coName) = getEmailAddrCoNameFromMatchString ($toEmailAddr) ;
+		$coName = "undefined: company not known" if (not defined $coName);
+		writeToContactTransactionTable (
+			$coName,
+			$toEmailAddr,
+			"email_sent",		# $thisAction
+			$letterID,
+			$letStrctStr,
+			$descriptionOfEmails);
+	} else {
+		
+		# unless told not to use the database:
+		if ($debug and $noDBinteractions){
+			say "the message info would have been written to the database (but debugging run AND --noDB used)"; }
+		elsif ($debug) {
+			say "the message info would have been written to the database (but debugging run ";}
+		elsif ($noDBinteractions){
+			say "the message info would have been written to the database (but --noDB used)" ;}
+		;
+		
+	}
+
+	$continueProcessingCondition =	
+	(	($amProcessingDatafile) 
+		&& 	(not eof($in)) 	
+		&& 	(	not (	($howManyToSend) 
+				&& ($howManyToSend >0)  
+				&& 	($emailSentCount == $howManyToSend)
+			)
+		)
+	);
+
+	print "================================================\n";
+
+	last if not defined( $in );
+	last if eof $in;
+}} 
+while ($continueProcessingCondition); 
+FUCKED_PERL_LOOPS: my $aaa = 1; 		#dummy, for the debugger if necessary
+
+# end over each input record 
+
+close $in;
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
